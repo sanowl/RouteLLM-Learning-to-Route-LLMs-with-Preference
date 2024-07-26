@@ -1,14 +1,14 @@
 import torch, torch.nn as nn, torch.optim as optim
 from transformers import AutoModel, AutoTokenizer, pipeline
-from typing import List, Dict, Tuple, Union, Callable
-from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support
-import random, numpy as np, pandas as pd
-from functools import partial
+from typing import List, Tuple, Dict, Callable
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from dataclasses import dataclass
 from tqdm import tqdm
 import matplotlib.pyplot as plt, seaborn as sns
 from ray import tune
+import pandas as pd 
 
 @dataclass
 class LLMConfig: name: str; model_name: str; cost_per_token: float; quality: float
@@ -25,8 +25,8 @@ class LLM:
 class AdvancedRouter(nn.Module):
     def __init__(self, input_size: int, hidden_size: int, num_models: int, num_layers: int = 2):
         super().__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers, batch_first=True, bidirectional=True)
-        self.attention, self.fc1, self.fc2, self.dropout = nn.MultiheadAttention(hidden_size * 2, 8), nn.Linear(hidden_size * 2, hidden_size), nn.Linear(hidden_size, num_models), nn.Dropout(0.2)
+        self.lstm, self.attention = nn.LSTM(input_size, hidden_size, num_layers=num_layers, batch_first=True, bidirectional=True), nn.MultiheadAttention(hidden_size * 2, 8)
+        self.fc1, self.fc2, self.dropout = nn.Linear(hidden_size * 2, hidden_size), nn.Linear(hidden_size, num_models), nn.Dropout(0.2)
     def forward(self, x, attention_mask):
         x, _ = self.lstm(x)
         x = x.transpose(0, 1)
@@ -43,8 +43,7 @@ class RouteLLM:
         self.models, self.device = models, device
         self.router = AdvancedRouter(768, 256, len(models)).to(device)
         self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
-        self.optimizer = optim.AdamW(self.router.parameters(), lr=2e-5)
-        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, T_0=100, T_mult=2)
+        self.optimizer, self.scheduler = optim.AdamW(self.router.parameters(), lr=2e-5), optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, T_0=100, T_mult=2)
         self.loss_fn = nn.CrossEntropyLoss()
 
     def route(self, query: str) -> LLM:
@@ -59,13 +58,22 @@ class RouteLLM:
         train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, len(dataset) - train_size])
         train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=self.collate_fn)
         val_dataloader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=self.collate_fn)
-        
         self.router.train()
         best_val_loss = float('inf')
         for epoch in range(epochs):
-            train_loss = sum(self.loss_fn(self.router(*batch[:2]), batch[1]).backward() or self.optimizer.step() or self.scheduler.step() or self.loss_fn(self.router(*batch[:2]), batch[1]).item() for batch in tqdm(train_dataloader, desc="Training")) / len(train_dataloader)
+            train_loss = 0.0
+            for batch in tqdm(train_dataloader, desc="Training"):
+                inputs, labels, attention_mask = batch
+                self.optimizer.zero_grad()
+                outputs = self.router(inputs, attention_mask)
+                loss = self.loss_fn(outputs, labels)
+                loss.backward()
+                self.optimizer.step()
+                self.scheduler.step()
+                train_loss += loss.item()
+            train_loss /= len(train_dataloader)
             self.router.eval()
-            val_loss = sum(self.loss_fn(self.router(*batch[:2]), batch[1]).item() for batch in val_dataloader) / len(val_dataloader)
+            val_loss = sum(self.loss_fn(self.router(inputs, attention_mask), labels).item() for inputs, labels, attention_mask in val_dataloader) / len(val_dataloader)
             self.router.train()
             print(f"Epoch {epoch + 1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
             if val_loss < best_val_loss: best_val_loss = val_loss; torch.save(self.router.state_dict(), 'best_router.pt')
@@ -77,7 +85,15 @@ class RouteLLM:
 
     def evaluate(self, data: List[Tuple[str, str]]) -> Dict[str, float]:
         self.router.eval()
-        predictions, truths, qualities, costs = zip(*[(self.models.index(model := self.route(query)), next(i for i, m in enumerate(self.models) if m.generate(query) == expected), model.config.quality, model.config.cost_per_token) for query, expected in tqdm(data, desc="Evaluating")])
+        predictions, truths, qualities, costs = [], [], [], []
+        for query, expected in tqdm(data, desc="Evaluating"):
+            model = self.route(query)
+            prediction = self.models.index(model)
+            truth = next(i for i, m in enumerate(self.models) if m.generate(query) == expected)
+            qualities.append(model.config.quality)
+            costs.append(model.config.cost_per_token)
+            predictions.append(prediction)
+            truths.append(truth)
         precision, recall, f1, _ = precision_recall_fscore_support(truths, predictions, average='weighted')
         return {"accuracy": accuracy_score(truths, predictions), "precision": precision, "recall": recall, "f1_score": f1, "avg_quality": np.mean(qualities), "avg_cost": np.mean(costs)}
 
