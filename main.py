@@ -1,142 +1,333 @@
-import torch, torch.nn as nn, torch.optim as optim
-from transformers import AutoModel, AutoTokenizer, pipeline
-from typing import List, Tuple, Dict, Callable
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
-import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from dataclasses import dataclass
+from transformers import AutoTokenizer, AutoModel, RobertaModel, RobertaTokenizer, GPT2LMHeadModel, GPT2Tokenizer
+from sklearn.model_selection import train_test_split
+import numpy as np
 from tqdm import tqdm
-import matplotlib.pyplot as plt, seaborn as sns
-from ray import tune
-import pandas as pd 
+import json
+import requests
+import openai
+from anthropic import Anthropic, HUMAN_PROMPT, AI_PROMPT
 
-@dataclass
-class LLMConfig: name: str; model_name: str; cost_per_token: float; quality: float
+# Define the dataset class
+class PreferenceDataset(Dataset):
+    def __init__(self, data, tokenizer, max_length=512):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.max_length = max_length
 
-class LLM:
-    def __init__(self, config: LLMConfig):
-        self.config, self.model, self.tokenizer = config, AutoModel.from_pretrained(config.model_name), AutoTokenizer.from_pretrained(config.model_name)
-        self.generator = pipeline('text-generation', model=config.model_name, tokenizer=config.model_name)
-    def generate(self, query: str, max_length: int = 150) -> str: return self.generator(query, max_length=max_length, num_return_sequences=1)[0]['generated_text']
-    def embed(self, query: str) -> torch.Tensor:
-        inputs = self.tokenizer(query, return_tensors="pt", padding=True, truncation=True, max_length=512)
-        with torch.no_grad(): return self.model(**inputs).last_hidden_state.mean(dim=1).squeeze()
+    def __len__(self):
+        return len(self.data)
 
-class AdvancedRouter(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, num_models: int, num_layers: int = 2):
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        encoding = self.tokenizer.encode_plus(
+            item['query'],
+            add_special_tokens=True,
+            max_length=self.max_length,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt'
+        )
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'label': torch.tensor(item['label'], dtype=torch.float)
+        }
+
+# Define the Similarity Weighted Ranking model
+class SimilarityWeightedRanking(nn.Module):
+    def __init__(self, model_name='roberta-base'):
         super().__init__()
-        self.lstm, self.attention = nn.LSTM(input_size, hidden_size, num_layers=num_layers, batch_first=True, bidirectional=True), nn.MultiheadAttention(hidden_size * 2, 8)
-        self.fc1, self.fc2, self.dropout = nn.Linear(hidden_size * 2, hidden_size), nn.Linear(hidden_size, num_models), nn.Dropout(0.2)
-    def forward(self, x, attention_mask):
-        x, _ = self.lstm(x)
-        x = x.transpose(0, 1)
-        attn_output, _ = self.attention(x, x, x, key_padding_mask=~attention_mask.bool())
-        return self.fc2(self.dropout(torch.relu(self.fc1(attn_output.mean(dim=0)))))
+        self.encoder = RobertaModel.from_pretrained(model_name)
+        self.similarity = nn.CosineSimilarity(dim=1)
+        self.classifier = nn.Linear(1, 1)
 
-class RouteLLMDataset(Dataset):
-    def __init__(self, data: List[Tuple[str, int]]): self.data = data
-    def __len__(self): return len(self.data)
-    def __getitem__(self, idx): return self.data[idx]
+    def forward(self, input_ids, attention_mask):
+        outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        embeddings = outputs.last_hidden_state[:, 0, :]  # Use CLS token
+        similarities = self.similarity(embeddings.unsqueeze(1), embeddings.unsqueeze(0))
+        return self.classifier(similarities.mean(dim=1).unsqueeze(1))
 
-class RouteLLM:
-    def __init__(self, models: List[LLM], device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
-        self.models, self.device = models, device
-        self.router = AdvancedRouter(768, 256, len(models)).to(device)
-        self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
-        self.optimizer, self.scheduler = optim.AdamW(self.router.parameters(), lr=2e-5), optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, T_0=100, T_mult=2)
-        self.loss_fn = nn.CrossEntropyLoss()
+# Define the Matrix Factorization model
+class MatrixFactorization(nn.Module):
+    def __init__(self, num_queries, num_models, embedding_dim=64):
+        super().__init__()
+        self.query_embedding = nn.Embedding(num_queries, embedding_dim)
+        self.model_embedding = nn.Embedding(num_models, embedding_dim)
 
-    def route(self, query: str) -> LLM:
-        self.router.eval()
-        with torch.no_grad():
-            inputs = self.tokenizer(query, return_tensors='pt', padding=True, truncation=True, max_length=512).to(self.device)
-            return self.models[self.router(**inputs).argmax().item()]
+    def forward(self, query_ids, model_ids):
+        query_embed = self.query_embedding(query_ids)
+        model_embed = self.model_embedding(model_ids)
+        return torch.sum(query_embed * model_embed, dim=1)
 
-    def train(self, data: List[Tuple[str, int]], epochs: int = 10, batch_size: int = 32, val_split: float = 0.1):
-        dataset = RouteLLMDataset(data)
-        train_size = int((1 - val_split) * len(dataset))
-        train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, len(dataset) - train_size])
-        train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=self.collate_fn)
-        val_dataloader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=self.collate_fn)
-        self.router.train()
-        best_val_loss = float('inf')
+# Define the RoBERTa Classifier model
+class RoBERTaClassifier(nn.Module):
+    def __init__(self, model_name='roberta-base'):
+        super().__init__()
+        self.roberta = RobertaModel.from_pretrained(model_name)
+        self.dropout = nn.Dropout(0.1)
+        self.classifier = nn.Linear(self.roberta.config.hidden_size, 1)
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
+        pooled_output = outputs.last_hidden_state[:, 0]
+        pooled_output = self.dropout(pooled_output)
+        return self.classifier(pooled_output)
+
+# Define the RouterTrainer class
+class RouterTrainer:
+    def __init__(self, model, device, learning_rate=2e-5):
+        self.model = model
+        self.device = device
+        self.model.to(self.device)
+        self.criterion = nn.BCEWithLogitsLoss()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
+
+    def train(self, train_loader, val_loader, epochs):
+        best_val_accuracy = 0
         for epoch in range(epochs):
-            train_loss = 0.0
-            for batch in tqdm(train_dataloader, desc="Training"):
-                inputs, labels, attention_mask = batch
-                self.optimizer.zero_grad()
-                outputs = self.router(inputs, attention_mask)
-                loss = self.loss_fn(outputs, labels)
-                loss.backward()
-                self.optimizer.step()
-                self.scheduler.step()
-                train_loss += loss.item()
-            train_loss /= len(train_dataloader)
-            self.router.eval()
-            val_loss = sum(self.loss_fn(self.router(inputs, attention_mask), labels).item() for inputs, labels, attention_mask in val_dataloader) / len(val_dataloader)
-            self.router.train()
-            print(f"Epoch {epoch + 1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
-            if val_loss < best_val_loss: best_val_loss = val_loss; torch.save(self.router.state_dict(), 'best_router.pt')
+            train_loss = self.train_epoch(train_loader)
+            val_loss, val_accuracy = self.evaluate(val_loader)
+            print(f"Epoch {epoch+1}/{epochs}")
+            print(f"Train Loss: {train_loss:.4f}")
+            print(f"Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}")
+            
+            if val_accuracy > best_val_accuracy:
+                best_val_accuracy = val_accuracy
+                torch.save(self.model.state_dict(), 'best_router_model.pth')
 
-    def collate_fn(self, batch):
-        queries, labels = zip(*batch)
-        encodings = self.tokenizer(list(queries), padding=True, truncation=True, max_length=512, return_tensors='pt')
-        return encodings['input_ids'], torch.tensor(labels), encodings['attention_mask']
+    def train_epoch(self, train_loader):
+        self.model.train()
+        total_loss = 0
+        for batch in tqdm(train_loader, desc="Training"):
+            self.optimizer.zero_grad()
+            input_ids = batch['input_ids'].to(self.device)
+            attention_mask = batch['attention_mask'].to(self.device)
+            labels = batch['label'].to(self.device)
+            
+            outputs = self.model(input_ids, attention_mask)
+            loss = self.criterion(outputs.squeeze(), labels)
+            
+            loss.backward()
+            self.optimizer.step()
+            total_loss += loss.item()
+        return total_loss / len(train_loader)
 
-    def evaluate(self, data: List[Tuple[str, str]]) -> Dict[str, float]:
-        self.router.eval()
-        predictions, truths, qualities, costs = [], [], [], []
-        for query, expected in tqdm(data, desc="Evaluating"):
-            model = self.route(query)
-            prediction = self.models.index(model)
-            truth = next(i for i, m in enumerate(self.models) if m.generate(query) == expected)
-            qualities.append(model.config.quality)
-            costs.append(model.config.cost_per_token)
-            predictions.append(prediction)
-            truths.append(truth)
-        precision, recall, f1, _ = precision_recall_fscore_support(truths, predictions, average='weighted')
-        return {"accuracy": accuracy_score(truths, predictions), "precision": precision, "recall": recall, "f1_score": f1, "avg_quality": np.mean(qualities), "avg_cost": np.mean(costs)}
+    def evaluate(self, val_loader):
+        self.model.eval()
+        total_loss = 0
+        correct_predictions = 0
+        total_predictions = 0
+        
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc="Evaluating"):
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                labels = batch['label'].to(self.device)
+                
+                outputs = self.model(input_ids, attention_mask)
+                loss = self.criterion(outputs.squeeze(), labels)
+                total_loss += loss.item()
+                
+                preds = torch.round(torch.sigmoid(outputs.squeeze()))
+                correct_predictions += (preds == labels).sum().item()
+                total_predictions += labels.size(0)
+        
+        avg_loss = total_loss / len(val_loader)
+        accuracy = correct_predictions / total_predictions
+        return avg_loss, accuracy
 
-    def calculate_metrics(self, data: List[Tuple[str, str]], metric_fns: Dict[str, Callable]) -> Dict[str, float]:
-        results = self.evaluate(data)
-        return {**results, **{name: fn(results) for name, fn in metric_fns.items()}}
+# Define the APIModel class
+class APIModel:
+    def __init__(self, model_type, api_key):
+        self.model_type = model_type
+        self.api_key = api_key
 
-    def visualize_performance(self, results: Dict[str, float]):
-        plt.figure(figsize=(12, 6))
-        sns.barplot(x=list(results.keys()), y=list(results.values()))
-        plt.title("RouteLLM Performance Metrics")
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        plt.savefig('routellm_performance.png')
-        plt.close()
+    def generate(self, prompt):
+        if self.model_type == 'gpt4':
+            return self.call_gpt4_api(prompt)
+        elif self.model_type == 'claude':
+            return self.call_claude_api(prompt)
+        elif self.model_type == 'llama':
+            return self.call_llama_api(prompt)
+        else:
+            raise ValueError(f"Unsupported model type: {self.model_type}")
 
-    def analyze_routing_decisions(self, data: List[Tuple[str, str]]) -> pd.DataFrame:
-        decisions = [{"query": query, "routed_to": model.config.name, "model_quality": model.config.quality, "model_cost": model.config.cost_per_token} for query, _ in data if (model := self.route(query))]
-        return pd.DataFrame(decisions).to_csv('routing_decisions.csv', index=False) or pd.DataFrame(decisions)
+    def call_gpt4_api(self, prompt):
+        openai.api_key = self.api_key
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=100
+        )
+        return response.choices[0].message.content.strip()
 
-# Example usage
-configs = [LLMConfig("BERT", "bert-base-uncased", 0.001, 0.7), LLMConfig("GPT2", "gpt2", 0.005, 0.8), LLMConfig("RoBERTa", "roberta-base", 0.008, 0.85), LLMConfig("BART", "facebook/bart-base", 0.01, 0.9)]
-models = [LLM(config) for config in configs]
-route_llm = RouteLLM(models)
+    def call_claude_api(self, prompt):
+        anthropic = Anthropic(api_key=self.api_key)
+        response = anthropic.completions.create(
+            model="claude-3.5-20240229",
+            prompt=f"{HUMAN_PROMPT} {prompt}{AI_PROMPT}",
+            max_tokens_to_sample=100
+        )
+        return response.completion
 
-train_data = [("What is the capital of France?", 0), ("Explain quantum entanglement", 3), ("Translate 'Hello' to French", 2), ("What is the plot of Hamlet?", 1)]
-route_llm.train(train_data, epochs=20)
+    def call_llama_api(self, prompt):
+        response = requests.post(
+            "https://api.together.xyz/inference",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "togethercomputer/llama-2-70b",
+                "prompt": prompt,
+                "max_tokens": 100,
+                "temperature": 0.7
+            }
+        )
+        return response.json()['output']['choices'][0]['text'].strip()
 
-eval_data = [("What is 2+2?", "BERT response: The result of 2+2 is 4."), ("Explain the theory of relativity", "BART response: The theory of relativity, proposed by Albert Einstein, describes how..."), ("Write a poem about spring", "GPT2 response: Blossoms bloom in gentle breeze,\nSunshine warms the waking trees...")]
-metric_fns = {"cost_efficiency": lambda r: r['avg_quality'] / r['avg_cost'], "performance_index": lambda r: (r['accuracy'] + r['f1_score']) * r['avg_quality']}
+# Define the OpenSourceModel class
+class OpenSourceModel:
+    def __init__(self, model_name='mistralai/Mixtral-8x7B-v0.1'):
+        self.model = AutoModel.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-results = route_llm.calculate_metrics(eval_data, metric_fns)
-print("Evaluation results:", results)
-route_llm.visualize_performance(results)
-routing_analysis = route_llm.analyze_routing_decisions(eval_data)
-print("Routing analysis:", routing_analysis.head())
+    def generate(self, prompt):
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        outputs = self.model.generate(**inputs, max_length=100)
+        return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-def objective(config):
-    route_llm = RouteLLM(models)
-    route_llm.router.fc1, route_llm.router.fc2 = nn.Linear(512, config['hidden_size']), nn.Linear(config['hidden_size'], len(models))
-    route_llm.train(train_data, epochs=5, batch_size=config['batch_size'])
-    results = route_llm.evaluate(eval_data)
-    return {"score": results['f1_score'], "cost": -results['avg_cost']}
+# Define the RouteLLM class
+class RouteLLM:
+    def __init__(self, router_models, models, tokenizer, device, threshold=0.5):
+        self.router_models = router_models
+        self.models = models
+        self.tokenizer = tokenizer
+        self.device = device
+        self.threshold = threshold
 
-analysis = tune.run(objective, config={"hidden_size": tune.choice([64, 128, 256]), "batch_size": tune.choice([16, 32, 64])}, num_samples=10, resources_per_trial={"cpu": 2, "gpu": 0.5})
-print("Best hyperparameters:", analysis.best_config)
+    def route_query(self, query):
+        inputs = self.tokenizer(query, return_tensors="pt", truncation=True, max_length=512)
+        input_ids = inputs["input_ids"].to(self.device)
+        attention_mask = inputs["attention_mask"].to(self.device)
+        
+        routing_scores = []
+        with torch.no_grad():
+            for router_model in self.router_models:
+                router_output = router_model(input_ids, attention_mask)
+                routing_scores.append(torch.sigmoid(router_output).item())
+        
+        avg_routing_score = sum(routing_scores) / len(routing_scores)
+        
+        if avg_routing_score > self.threshold:
+            # Use a more sophisticated selection method for API models
+            api_model_scores = {
+                'gpt4': routing_scores[0],
+                'claude': routing_scores[1],
+                'llama': routing_scores[2]
+            }
+            selected_api_model = max(api_model_scores, key=api_model_scores.get)
+            return self.models[selected_api_model].generate(query)
+        else:
+            return self.models['opensource'].generate(query)
+
+    def chain_of_thought(self, query):
+        # Implement Chain-of-Thought reasoning
+        steps = self.route_query(query).split('. ')
+        detailed_steps = []
+        for step in steps:
+            detailed_steps.append(self.route_query(step))
+        return ' '.join(detailed_steps)
+
+def evaluate_routellm(routellm, test_data):
+    total_queries = len(test_data)
+    correct_predictions = 0
+    api_model_calls = 0
+    
+    for item in tqdm(test_data, desc="Evaluating RouteLLM"):
+        query = item['query']
+        expected_response = item['response']
+        
+        routed_response = routellm.route_query(query)
+        if routed_response == expected_response:
+            correct_predictions += 1
+            if routellm.route_query(query) != routellm.models['opensource'].generate(query):
+                api_model_calls += 1
+    
+    accuracy = correct_predictions / total_queries
+    api_model_usage = api_model_calls / total_queries
+    
+    return accuracy, api_model_usage
+
+def calculate_cpt(routellm, test_data, desired_pgr):
+    thresholds = np.linspace(0, 1, 100)
+    for threshold in thresholds:
+        routellm.threshold = threshold
+        accuracy, api_model_usage = evaluate_routellm(routellm, test_data)
+        if accuracy >= desired_pgr:
+            return api_model_usage
+    return 1.0  # If desired PGR is not achievable
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Load data
+    with open('preference_data.json', 'r') as f:
+        data = json.load(f)
+    
+    # Initialize tokenizer and router models
+    tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
+    router_models = [
+        SimilarityWeightedRanking().to(device),
+        RoBERTaClassifier().to(device),
+        MatrixFactorization(len(data), 4).to(device)  # 4 models: GPT-4, Claude, Llama, and Mixtral
+    ]
+    
+    # Initialize API and open-source models
+    gpt4_model = APIModel('gpt4', 'your-openai-api-key')
+    claude_model = APIModel('claude', 'your-anthropic-api-key')
+    llama_model = APIModel('llama', 'your-together-api-key')
+    opensource_model = OpenSourceModel()
+    
+    models = {
+        'gpt4': gpt4_model,
+        'claude': claude_model,
+        'llama': llama_model,
+        'opensource': opensource_model
+    }
+    
+    # Create dataset and data loaders
+    dataset = PreferenceDataset(data, tokenizer)
+    train_data, val_data = train_test_split(dataset, test_size=0.2, random_state=42)
+    train_loader = DataLoader(train_data, batch_size=32, shuffle=True)
+    val_loader = DataLoader(val_data, batch_size=32)
+    
+    # Train the router models
+    for i, router_model in enumerate(router_models):
+        print(f"Training Router Model {i+1}")
+        trainer = RouterTrainer(router_model, device)
+        trainer.train(train_loader, val_loader, epochs=5)
+    
+    # Initialize RouteLLM
+    routellm = RouteLLM(router_models, models, tokenizer, device)
+    
+    # Evaluate RouteLLM
+    with open('test_data.json', 'r') as f:
+        test_data = json.load(f)
+    
+    accuracy, api_model_usage = evaluate_routellm(routellm, test_data)
+    print(f"RouteLLM Accuracy: {accuracy:.4f}")
+    print(f"API Model Usage: {api_model_usage:.4f}")
+    
+    # Calculate CPT for different PGR levels
+    for pgr in [0.5, 0.8]:
+        cpt = calculate_cpt(routellm, test_data, pgr)
+        print(f"CPT for PGR {pgr}: {cpt:.4f}")
+
+if __name__ == "__main__":
+    main()
