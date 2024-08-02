@@ -4,14 +4,18 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel, RobertaModel, RobertaTokenizer, GPT2LMHeadModel, GPT2Tokenizer
 from sklearn.model_selection import train_test_split
+from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 from tqdm import tqdm
 import json
 import requests
 import openai
 from anthropic import Anthropic, HUMAN_PROMPT, AI_PROMPT
+import nltk
+from nltk.tokenize import sent_tokenize
 
-# Define the dataset class
+nltk.download('punkt', quiet=True)
+
 class PreferenceDataset(Dataset):
     def __init__(self, data, tokenizer, max_length=512):
         self.data = data
@@ -38,7 +42,6 @@ class PreferenceDataset(Dataset):
             'label': torch.tensor(item['label'], dtype=torch.float)
         }
 
-# Define the Similarity Weighted Ranking model
 class SimilarityWeightedRanking(nn.Module):
     def __init__(self, model_name='roberta-base'):
         super().__init__()
@@ -52,7 +55,6 @@ class SimilarityWeightedRanking(nn.Module):
         similarities = self.similarity(embeddings.unsqueeze(1), embeddings.unsqueeze(0))
         return self.classifier(similarities.mean(dim=1).unsqueeze(1))
 
-# Define the Matrix Factorization model
 class MatrixFactorization(nn.Module):
     def __init__(self, num_queries, num_models, embedding_dim=64):
         super().__init__()
@@ -64,7 +66,6 @@ class MatrixFactorization(nn.Module):
         model_embed = self.model_embedding(model_ids)
         return torch.sum(query_embed * model_embed, dim=1)
 
-# Define the RoBERTa Classifier model
 class RoBERTaClassifier(nn.Module):
     def __init__(self, model_name='roberta-base'):
         super().__init__()
@@ -78,7 +79,6 @@ class RoBERTaClassifier(nn.Module):
         pooled_output = self.dropout(pooled_output)
         return self.classifier(pooled_output)
 
-# Define the RouterTrainer class
 class RouterTrainer:
     def __init__(self, model, device, learning_rate=2e-5):
         self.model = model
@@ -141,7 +141,6 @@ class RouterTrainer:
         accuracy = correct_predictions / total_predictions
         return avg_loss, accuracy
 
-# Define the APIModel class
 class APIModel:
     def __init__(self, model_type, api_key):
         self.model_type = model_type
@@ -191,28 +190,99 @@ class APIModel:
         )
         return response.json()['output']['choices'][0]['text'].strip()
 
-# Define the OpenSourceModel class
 class OpenSourceModel:
     def __init__(self, model_name='mistralai/Mixtral-8x7B-v0.1'):
-        self.model = AutoModel.from_pretrained(model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = GPT2LMHeadModel.from_pretrained(model_name)
+        self.tokenizer = GPT2Tokenizer.from_pretrained(model_name)
 
     def generate(self, prompt):
         inputs = self.tokenizer(prompt, return_tensors="pt")
         outputs = self.model.generate(**inputs, max_length=100)
         return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-# Define the RouteLLM class
-class RouteLLM:
+class LLMBlender:
+    def __init__(self, models):
+        self.models = models
+        self.tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
+        self.model = AutoModel.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
+
+    def generate_responses(self, query):
+        responses = []
+        for model in self.models.values():
+            responses.append(model.generate(query))
+        return responses
+
+    def get_embeddings(self, texts):
+        inputs = self.tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=512)
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+        return outputs.last_hidden_state.mean(dim=1).numpy()
+
+    def calculate_coherence(self, response):
+        sentences = sent_tokenize(response)
+        if len(sentences) < 2:
+            return 0
+        embeddings = self.get_embeddings(sentences)
+        coherence_scores = []
+        for i in range(len(embeddings) - 1):
+            coherence_scores.append(cosine_similarity([embeddings[i]], [embeddings[i+1]])[0][0])
+        return np.mean(coherence_scores)
+
+    def rank_responses(self, query, responses):
+        query_embedding = self.get_embeddings([query])[0]
+        response_embeddings = self.get_embeddings(responses)
+        
+        scores = []
+        for i, response in enumerate(responses):
+            length_score = len(response) / max(len(r) for r in responses)
+            relevance_score = cosine_similarity([query_embedding], [response_embeddings[i]])[0][0]
+            coherence_score = self.calculate_coherence(response)
+            
+            combined_score = 0.3 * length_score + 0.4 * relevance_score + 0.3 * coherence_score
+            scores.append(combined_score)
+        
+        return responses[np.argmax(scores)]
+
+    def blend(self, query):
+        responses = self.generate_responses(query)
+        return self.rank_responses(query, responses)
+
+class PromptEngineer:
+    def __init__(self):
+        self.templates = {
+            "general": "Please answer the following question: {query}",
+            "math": "Solve the following math problem step by step: {query}",
+            "coding": "Write a function to solve the following programming problem: {query}",
+            "analysis": "Provide a detailed analysis of the following topic: {query}"
+        }
+
+    def classify_query(self, query):
+        if any(keyword in query.lower() for keyword in ["calculate", "solve", "equation"]):
+            return "math"
+        elif any(keyword in query.lower() for keyword in ["function", "code", "program"]):
+            return "coding"
+        elif any(keyword in query.lower() for keyword in ["analyze", "explain", "discuss"]):
+            return "analysis"
+        else:
+            return "general"
+
+    def engineer_prompt(self, query):
+        query_type = self.classify_query(query)
+        return self.templates[query_type].format(query=query)
+
+class EnhancedRouteLLM:
     def __init__(self, router_models, models, tokenizer, device, threshold=0.5):
         self.router_models = router_models
         self.models = models
         self.tokenizer = tokenizer
         self.device = device
         self.threshold = threshold
+        self.blender = LLMBlender(self.models)
+        self.prompt_engineer = PromptEngineer()
 
     def route_query(self, query):
-        inputs = self.tokenizer(query, return_tensors="pt", truncation=True, max_length=512)
+        engineered_prompt = self.prompt_engineer.engineer_prompt(query)
+        inputs = self.tokenizer(engineered_prompt, return_tensors="pt", truncation=True, max_length=512)
         input_ids = inputs["input_ids"].to(self.device)
         attention_mask = inputs["attention_mask"].to(self.device)
         
@@ -225,31 +295,24 @@ class RouteLLM:
         avg_routing_score = sum(routing_scores) / len(routing_scores)
         
         if avg_routing_score > self.threshold:
-            # Use a more sophisticated selection method for API models
-            api_model_scores = {
-                'gpt4': routing_scores[0],
-                'claude': routing_scores[1],
-                'llama': routing_scores[2]
-            }
-            selected_api_model = max(api_model_scores, key=api_model_scores.get)
-            return self.models[selected_api_model].generate(query)
+            return self.blender.blend(engineered_prompt)
         else:
-            return self.models['opensource'].generate(query)
+            return self.models['opensource'].generate(engineered_prompt)
 
     def chain_of_thought(self, query):
-        # Implement Chain-of-Thought reasoning
-        steps = self.route_query(query).split('. ')
+        engineered_prompt = self.prompt_engineer.engineer_prompt(query)
+        steps = self.route_query(engineered_prompt).split('. ')
         detailed_steps = []
         for step in steps:
-            detailed_steps.append(self.route_query(step))
+            detailed_steps.append(self.route_query(self.prompt_engineer.engineer_prompt(step)))
         return ' '.join(detailed_steps)
 
-def evaluate_routellm(routellm, test_data):
+def evaluate_enhanced_routellm(routellm, test_data):
     total_queries = len(test_data)
     correct_predictions = 0
-    api_model_calls = 0
+    blender_calls = 0
     
-    for item in tqdm(test_data, desc="Evaluating RouteLLM"):
+    for item in tqdm(test_data, desc="Evaluating EnhancedRouteLLM"):
         query = item['query']
         expected_response = item['response']
         
@@ -257,21 +320,23 @@ def evaluate_routellm(routellm, test_data):
         if routed_response == expected_response:
             correct_predictions += 1
             if routellm.route_query(query) != routellm.models['opensource'].generate(query):
-                api_model_calls += 1
+                blender_calls += 1
     
     accuracy = correct_predictions / total_queries
-    api_model_usage = api_model_calls / total_queries
+    blender_usage = blender_calls / total_queries
     
-    return accuracy, api_model_usage
+    return accuracy, blender_usage
 
 def calculate_cpt(routellm, test_data, desired_pgr):
     thresholds = np.linspace(0, 1, 100)
     for threshold in thresholds:
         routellm.threshold = threshold
-        accuracy, api_model_usage = evaluate_routellm(routellm, test_data)
+        accuracy, blender_usage = evaluate_enhanced_routellm(routellm, test_data)
         if accuracy >= desired_pgr:
-            return api_model_usage
+            return blender_usage
     return 1.0  # If desired PGR is not achievable
+
+# ... (All previous code remains the same)
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -313,21 +378,35 @@ def main():
         trainer = RouterTrainer(router_model, device)
         trainer.train(train_loader, val_loader, epochs=5)
     
-    # Initialize RouteLLM
-    routellm = RouteLLM(router_models, models, tokenizer, device)
+    # Initialize EnhancedRouteLLM
+    enhanced_routellm = EnhancedRouteLLM(router_models, models, tokenizer, device)
     
-    # Evaluate RouteLLM
+    # Evaluate EnhancedRouteLLM
     with open('test_data.json', 'r') as f:
         test_data = json.load(f)
     
-    accuracy, api_model_usage = evaluate_routellm(routellm, test_data)
-    print(f"RouteLLM Accuracy: {accuracy:.4f}")
-    print(f"API Model Usage: {api_model_usage:.4f}")
+    accuracy, blender_usage = evaluate_enhanced_routellm(enhanced_routellm, test_data)
+    print(f"EnhancedRouteLLM Accuracy: {accuracy:.4f}")
+    print(f"Blender Usage: {blender_usage:.4f}")
     
     # Calculate CPT for different PGR levels
     for pgr in [0.5, 0.8]:
-        cpt = calculate_cpt(routellm, test_data, pgr)
+        cpt = calculate_cpt(enhanced_routellm, test_data, pgr)
         print(f"CPT for PGR {pgr}: {cpt:.4f}")
+    
+    # Example usage of chain-of-thought reasoning
+    example_query = "Explain the process of photosynthesis and its importance in the ecosystem."
+    cot_response = enhanced_routellm.chain_of_thought(example_query)
+    print(f"Chain of Thought Response:\n{cot_response}")
+    
+    # Interactive mode for user queries
+    print("\nEntering interactive mode. Type 'exit' to quit.")
+    while True:
+        user_query = input("\nEnter your query: ")
+        if user_query.lower() == 'exit':
+            break
+        response = enhanced_routellm.route_query(user_query)
+        print(f"Response: {response}")
 
 if __name__ == "__main__":
     main()
