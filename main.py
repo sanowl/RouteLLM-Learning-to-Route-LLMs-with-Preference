@@ -241,8 +241,8 @@ class APIModel:
                 "prompt": prompt,
                 "max_tokens": 100,
                 "temperature": 0.7
-            }
-        )
+            }, 
+        timeout=60)
         return response.json()['output']['choices'][0]['text'].strip()
 
 class OpenSourceModel:
